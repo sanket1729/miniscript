@@ -20,6 +20,7 @@
 #include <util/spanparsing.h>
 #include <util/strencodings.h>
 #include <util/vector.h>
+#include <primitives/transaction.h>
 
 namespace miniscript {
 
@@ -293,6 +294,41 @@ struct StackSize {
     StackSize(MaxInt<uint32_t> in_sat, MaxInt<uint32_t> in_dsat) : sat(in_sat), dsat(in_dsat) {};
 };
 
+struct TimeLockInfo {
+    //! csv with heights
+    bool csv_h;
+    //! csv with times
+    bool csv_t;
+    //! cltv with heights
+    bool cltv_h;
+    //! cltv with times
+    bool cltv_t;
+    //! combination of any heightlocks and timelocks
+    bool is_combination;
+
+    TimeLockInfo(bool csv_h, bool csv_t, bool cltv_h, bool cltv_t, bool is_combination) : csv_h(csv_h), csv_t(csv_t), cltv_h(cltv_h), cltv_t(cltv_t), is_combination(is_combination) {};
+
+    TimeLockInfo() : csv_h(false), csv_t(false), cltv_h(false), cltv_t(false), is_combination(false) {};
+
+    TimeLockInfo(uint32_t k, std::vector<TimeLockInfo> tl_info_vec) {
+        csv_h = csv_t = cltv_h = cltv_t = is_combination = false;
+        for (const auto sub_tl_info: tl_info_vec) {
+            if (k >= 2) {
+                is_combination |=
+                        (csv_h && sub_tl_info.csv_t)
+                    || (csv_t && sub_tl_info.csv_h)
+                    || (cltv_t && sub_tl_info.cltv_h)
+                    || (cltv_h && sub_tl_info.cltv_t);
+            }
+            csv_h |= sub_tl_info.csv_h;
+            csv_t |= sub_tl_info.csv_t;
+            cltv_h |= sub_tl_info.cltv_h;
+            cltv_t |= sub_tl_info.cltv_t;
+            is_combination |= sub_tl_info.is_combination;
+        }
+    };
+};
+
 } // namespace internal
 
 //! A node in a miniscript expression.
@@ -314,6 +350,8 @@ private:
     const internal::Ops ops;
     //! Cached stack size bounds.
     const internal::StackSize ss;
+    //! Cached information about timelocks
+    const internal::TimeLockInfo tl_info;
     //! Cached expression type (computed by CalcType and fed through SanitizeType).
     const Type typ;
     //! Cached script length (computed by CalcScriptLen).
@@ -568,6 +606,45 @@ private:
         return {{}, {}};
     }
 
+    internal::TimeLockInfo CalcTimeLockInfo() const {
+        switch (nodetype) {
+            case NodeType::PK_K:
+            case NodeType::PK_H: return internal::TimeLockInfo();
+            case NodeType::OLDER: return internal::TimeLockInfo(k < CTxIn::SEQUENCE_LOCKTIME_TYPE_FLAG, k >= CTxIn::SEQUENCE_LOCKTIME_TYPE_FLAG, false, false, false);
+            case NodeType::AFTER: return internal::TimeLockInfo(false, false, k < LOCKTIME_THRESHOLD, k >= LOCKTIME_THRESHOLD, false);
+            case NodeType::SHA256:
+            case NodeType::RIPEMD160:
+            case NodeType::HASH256:
+            case NodeType::HASH160: return internal::TimeLockInfo();
+            case NodeType::ANDOR: return internal::TimeLockInfo(1, Vector(internal::TimeLockInfo(2, Vector(subs[0]->tl_info, subs[1]->tl_info)), subs[2]->tl_info));
+            case NodeType::AND_V:
+            case NodeType::AND_B: return internal::TimeLockInfo(2, Vector(subs[0]->tl_info, subs[1]->tl_info));
+            case NodeType::OR_B:
+            case NodeType::OR_C:
+            case NodeType::OR_D:
+            case NodeType::OR_I: return internal::TimeLockInfo(1, Vector(subs[0]->tl_info, subs[1]->tl_info));
+            case NodeType::MULTI: return internal::TimeLockInfo();
+            case NodeType::WRAP_A:
+            case NodeType::WRAP_S:
+            case NodeType::WRAP_C:
+            case NodeType::WRAP_D:
+            case NodeType::WRAP_V:
+            case NodeType::WRAP_J:
+            case NodeType::WRAP_N: return subs[0]->tl_info;
+            case NodeType::JUST_1:
+            case NodeType::JUST_0: return internal::TimeLockInfo();
+            case NodeType::THRESH: {
+                std::vector<internal::TimeLockInfo> tl_info_vec;
+                for (const auto& sub : subs) {
+                    tl_info_vec.push_back(sub->tl_info);
+                }
+                return internal::TimeLockInfo(k, tl_info_vec);
+            }
+        }
+        assert(false);
+        return internal::TimeLockInfo();
+    }
+
     template<typename Ctx>
     internal::InputResult ProduceInput(const Ctx& ctx, bool nonmal) const {
         auto ret = ProduceInputHelper(ctx, nonmal);
@@ -801,12 +878,12 @@ public:
     }
 
     // Constructors with various argument combinations.
-    Node(NodeType nt, std::vector<NodeRef<Key>> sub, std::vector<unsigned char> arg, uint32_t val = 0) : nodetype(nt), k(val), data(std::move(arg)), subs(std::move(sub)), ops(CalcOps()), ss(CalcStackSize()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
-    Node(NodeType nt, std::vector<unsigned char> arg, uint32_t val = 0) : nodetype(nt), k(val), data(std::move(arg)), ops(CalcOps()), ss(CalcStackSize()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
-    Node(NodeType nt, std::vector<NodeRef<Key>> sub, std::vector<Key> key, uint32_t val = 0) : nodetype(nt), k(val), keys(std::move(key)), subs(std::move(sub)), ops(CalcOps()), ss(CalcStackSize()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
-    Node(NodeType nt, std::vector<Key> key, uint32_t val = 0) : nodetype(nt), k(val), keys(std::move(key)), ops(CalcOps()), ss(CalcStackSize()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
-    Node(NodeType nt, std::vector<NodeRef<Key>> sub, uint32_t val = 0) : nodetype(nt), k(val), subs(std::move(sub)), ops(CalcOps()), ss(CalcStackSize()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
-    Node(NodeType nt, uint32_t val = 0) : nodetype(nt), k(val), ops(CalcOps()), ss(CalcStackSize()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
+    Node(NodeType nt, std::vector<NodeRef<Key>> sub, std::vector<unsigned char> arg, uint32_t val = 0) : nodetype(nt), k(val), data(std::move(arg)), subs(std::move(sub)), ops(CalcOps()), ss(CalcStackSize()), tl_info(CalcTimeLockInfo()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
+    Node(NodeType nt, std::vector<unsigned char> arg, uint32_t val = 0) : nodetype(nt), k(val), data(std::move(arg)), ops(CalcOps()), ss(CalcStackSize()), tl_info(CalcTimeLockInfo()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
+    Node(NodeType nt, std::vector<NodeRef<Key>> sub, std::vector<Key> key, uint32_t val = 0) : nodetype(nt), k(val), keys(std::move(key)), subs(std::move(sub)), ops(CalcOps()), ss(CalcStackSize()), tl_info(CalcTimeLockInfo()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
+    Node(NodeType nt, std::vector<Key> key, uint32_t val = 0) : nodetype(nt), k(val), keys(std::move(key)), ops(CalcOps()), ss(CalcStackSize()), tl_info(CalcTimeLockInfo()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
+    Node(NodeType nt, std::vector<NodeRef<Key>> sub, uint32_t val = 0) : nodetype(nt), k(val), subs(std::move(sub)), ops(CalcOps()), ss(CalcStackSize()), tl_info(CalcTimeLockInfo()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
+    Node(NodeType nt, uint32_t val = 0) : nodetype(nt), k(val), ops(CalcOps()), ss(CalcStackSize()), tl_info(CalcTimeLockInfo()), typ(CalcType()), scriptlen(CalcScriptLen()) {}
 };
 
 namespace internal {
